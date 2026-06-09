@@ -11,6 +11,27 @@
 --  * No authorization decision reads user_metadata (it is user-editable).
 
 -- ---------------------------------------------------------------------------
+-- Teardown: drop everything so this script is safe to re-run from scratch.
+-- CASCADE on tables removes their policies, indexes, and dependent triggers.
+-- ---------------------------------------------------------------------------
+drop trigger if exists on_auth_user_created on auth.users;
+
+drop table if exists public.card_activity        cascade;
+drop table if exists public.comments             cascade;
+drop table if exists public.cards                cascade;
+drop table if exists public.columns              cascade;
+drop table if exists public.projects             cascade;
+drop table if exists public.organization_members cascade;
+drop table if exists public.organizations        cascade;
+drop table if exists public.profiles             cascade;
+
+drop function if exists public.handle_new_user();
+drop function if exists public.handle_new_org();
+drop function if exists public.add_org_member(uuid, text, text);
+
+drop schema if exists private cascade;
+
+-- ---------------------------------------------------------------------------
 -- Extensions
 -- ---------------------------------------------------------------------------
 create extension if not exists "pgcrypto";
@@ -68,15 +89,40 @@ create table if not exists public.columns (
 );
 
 create table if not exists public.cards (
-  id          uuid primary key default gen_random_uuid(),
-  column_id   uuid not null references public.columns (id) on delete cascade,
-  title       text not null default 'Untitled',
-  description text not null default '',
-  color       text not null default 'none',
-  due_date    date,
-  position    integer not null default 0,
-  created_by  uuid references public.profiles (id),
-  created_at  timestamptz not null default now()
+  id           uuid primary key default gen_random_uuid(),
+  column_id    uuid not null references public.columns (id) on delete cascade,
+  title        text not null default 'Untitled',
+  description  text not null default '',
+  color        text not null default 'none',
+  due_date     date,
+  position     integer not null default 0,
+  created_by   uuid references public.profiles (id),
+  assignee_id  uuid references public.profiles (id) on delete set null,
+  reporter_id  uuid references public.profiles (id) on delete set null,
+  epic_id      uuid references public.cards (id) on delete set null,
+  story_points integer check (story_points is null or story_points >= 0),
+  links        jsonb not null default '[]',
+  label_text   text,
+  closed_at    timestamptz,
+  created_at   timestamptz not null default now()
+);
+
+create table if not exists public.comments (
+  id         uuid primary key default gen_random_uuid(),
+  card_id    uuid not null references public.cards (id) on delete cascade,
+  author_id  uuid not null references public.profiles (id) on delete cascade,
+  body       text not null check (char_length(body) between 1 and 10000),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz
+);
+
+create table if not exists public.card_activity (
+  id         uuid primary key default gen_random_uuid(),
+  card_id    uuid not null references public.cards (id) on delete cascade,
+  actor_id   uuid references public.profiles (id) on delete set null,
+  type       text not null,
+  data       jsonb not null default '{}',
+  created_at timestamptz not null default now()
 );
 
 create index if not exists idx_members_org    on public.organization_members (org_id);
@@ -84,6 +130,8 @@ create index if not exists idx_members_user    on public.organization_members (u
 create index if not exists idx_projects_org    on public.projects (org_id);
 create index if not exists idx_columns_project on public.columns (project_id);
 create index if not exists idx_cards_column    on public.cards (column_id);
+create index if not exists idx_comments_card        on public.comments (card_id);
+create index if not exists idx_card_activity_card   on public.card_activity (card_id, created_at desc);
 
 -- ---------------------------------------------------------------------------
 -- Authorization helpers (SECURITY DEFINER, private schema)
@@ -135,6 +183,18 @@ returns boolean language sql security definer set search_path = '' stable as $$
   );
 $$;
 
+create or replace function private.can_access_card(_card uuid)
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1
+    from public.cards c
+    join public.columns col on col.id = c.column_id
+    join public.projects p   on p.id   = col.project_id
+    join public.organization_members m on m.org_id = p.org_id
+    where c.id = _card and m.user_id = auth.uid()
+  );
+$$;
+
 -- Policy expressions are evaluated as the invoking role, so authenticated
 -- needs USAGE on the schema + EXECUTE on the helpers. anon never does.
 grant usage on schema private to authenticated;
@@ -157,7 +217,6 @@ begin
 end;
 $$;
 
-drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
@@ -172,7 +231,6 @@ begin
 end;
 $$;
 
-drop trigger if exists on_org_created on public.organizations;
 create trigger on_org_created
   after insert on public.organizations
   for each row execute function public.handle_new_org();
@@ -220,6 +278,8 @@ alter table public.organization_members enable row level security;
 alter table public.projects             enable row level security;
 alter table public.columns              enable row level security;
 alter table public.cards                enable row level security;
+alter table public.comments             enable row level security;
+alter table public.card_activity        enable row level security;
 
 -- profiles -------------------------------------------------------------------
 create policy "profiles: read self or co-members" on public.profiles
@@ -327,3 +387,30 @@ create policy "cards: members update" on public.cards
 create policy "cards: members delete" on public.cards
   for delete to authenticated
   using (private.can_access_column(column_id));
+
+-- comments -------------------------------------------------------------------
+create policy "comments: members read" on public.comments
+  for select to authenticated
+  using (private.can_access_card(card_id));
+
+create policy "comments: members create" on public.comments
+  for insert to authenticated
+  with check (author_id = (select auth.uid()) and private.can_access_card(card_id));
+
+create policy "comments: own update" on public.comments
+  for update to authenticated
+  using  (author_id = (select auth.uid()))
+  with check (author_id = (select auth.uid()));
+
+create policy "comments: own delete" on public.comments
+  for delete to authenticated
+  using (author_id = (select auth.uid()));
+
+-- card_activity ---------------------------------------------------------------
+create policy "activity: members read" on public.card_activity
+  for select to authenticated
+  using (private.can_access_card(card_id));
+
+create policy "activity: members create" on public.card_activity
+  for insert to authenticated
+  with check (actor_id = (select auth.uid()) and private.can_access_card(card_id));

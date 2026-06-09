@@ -39,13 +39,22 @@ export const useWorkspace = create((set, get) => ({
   },
 
   createOrg: async (name) => {
+   const { data: s } = await supabase.auth.getSession();
+    const token = s.session?.access_token;
+    const payload = token ? JSON.parse(atob(token.split('.')[1])) : null;
+    console.log('JWT payload:', payload);
+
     const { data: u } = await supabase.auth.getUser();
+    console.log('Current user:', u);
     const { data, error } = await supabase
       .from("organizations")
       .insert({ name, created_by: u.user.id })
       .select("id, name, created_by, created_at")
       .single();
-    if (error) return { error };
+    if (error) {
+      console.log(error)
+      return { error }; 
+    }
     set((s) => ({ orgs: [...s.orgs, data] }));
     await get().selectOrg(data.id);
     return { data };

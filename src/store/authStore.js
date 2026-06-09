@@ -30,9 +30,16 @@ export const useAuth = create((set, get) => ({
     if (!user) return;
     const { data } = await supabase
       .from("profiles")
+      .upsert(
+        {
+          id: user.id,
+          email: user.email,
+          full_name: user.user_metadata?.full_name ?? user.email.split("@")[0],
+        },
+        { onConflict: "id", ignoreDuplicates: true }
+      )
       .select("id, email, full_name, avatar_url")
-      .eq("id", user.id)
-      .maybeSingle();
+      .single();
     set({ profile: data ?? { id: user.id, email: user.email, full_name: null } });
   },
 

@@ -1,12 +1,39 @@
-import { memo, useState, useRef, useEffect } from "react";
-import { useDroppable } from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { Plus, Trash2, Check, X } from "lucide-react";
+import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { Plus, Trash2, Check, X, CornerDownRight, GripVertical } from "lucide-react";
 import { useBoard } from "../store/boardStore";
 import { SortableCard } from "./SortableCard";
 import { EmptyColumn } from "./EmptyColumn";
 
-function ColumnBase({ column }) {
+// Returns a grouped structure for the column.
+// Top-level cards (no parent, or parent in another column) are kept in position
+// order; their children in this column are inserted immediately after them.
+function buildGrouped(cards, allCardsById) {
+  const inCol = new Set(cards.map((c) => c.id));
+
+  const childrenOf = {}; // parentId → Card[]
+  const topLevel = [];
+
+  for (const card of cards) {
+    if (card.epicId && inCol.has(card.epicId)) {
+      (childrenOf[card.epicId] ??= []).push(card);
+    } else {
+      topLevel.push(card);
+    }
+  }
+
+  // Flat ID order that SortableContext will use
+  const flatIds = [];
+  for (const card of topLevel) {
+    flatIds.push(card.id);
+    (childrenOf[card.id] ?? []).forEach((c) => flatIds.push(c.id));
+  }
+
+  return { topLevel, childrenOf, flatIds };
+}
+
+function ColumnBase({ column, groupByParent = false, isCardActive = false }) {
   const cardsById = useBoard((s) => s.cards);
   const addCard = useBoard((s) => s.addCard);
   const renameColumn = useBoard((s) => s.renameColumn);
@@ -14,9 +41,25 @@ function ColumnBase({ column }) {
 
   const cards = column.cardIds.map((id) => cardsById[id]).filter(Boolean);
 
-  const { setNodeRef, isOver } = useDroppable({
+  const { topLevel, childrenOf, flatIds } = useMemo(
+    () => buildGrouped(cards, cardsById),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [column.cardIds, cardsById]
+  );
+
+  const sortableItems = groupByParent ? flatIds : column.cardIds;
+
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+    isOver,
+  } = useSortable({
     id: column.id,
-    data: { type: "column", columnId: column.id },
+    data: { type: "column", column },
   });
 
   const [editing, setEditing] = useState(false);
@@ -35,9 +78,24 @@ function ColumnBase({ column }) {
     setEditing(false);
   };
 
+  const style = { transform: CSS.Transform.toString(transform), transition };
+
   return (
-    <section className="flex h-full w-[85vw] shrink-0 flex-col sm:w-80">
+    <section
+      ref={setNodeRef}
+      style={style}
+      className={["flex h-full w-[85vw] shrink-0 flex-col sm:w-80", isDragging ? "opacity-40" : ""].join(" ")}
+    >
       <header className="glass sticky top-0 z-10 mb-3 flex items-center gap-2 rounded-xl px-3 py-2.5">
+        <button
+          type="button"
+          aria-label="Drag column"
+          {...attributes}
+          {...listeners}
+          className="cursor-grab rounded-md p-0.5 text-slate-300 hover:text-slate-500 active:cursor-grabbing dark:text-slate-600 dark:hover:text-slate-400"
+        >
+          <GripVertical className="h-4 w-4" />
+        </button>
         {editing ? (
           <form
             className="flex flex-1 items-center gap-1"
@@ -111,18 +169,47 @@ function ColumnBase({ column }) {
       </header>
 
       <div
-        ref={setNodeRef}
         className={[
           "scroll-thin flex-1 space-y-2.5 overflow-y-auto rounded-xl p-1 transition-colors",
-          isOver ? "bg-sky-500/5 ring-1 ring-sky-500/20" : "",
+          isOver && isCardActive ? "bg-sky-500/5 ring-1 ring-sky-500/20" : "",
         ].join(" ")}
       >
-        <SortableContext items={column.cardIds} strategy={verticalListSortingStrategy}>
+        <SortableContext items={sortableItems} strategy={verticalListSortingStrategy}>
           {cards.length > 0 ? (
             <ul className="space-y-2.5">
-              {cards.map((card) => (
-                <SortableCard key={card.id} card={card} />
-              ))}
+              {groupByParent
+                ? topLevel.map((card) => {
+                    const children = childrenOf[card.id] ?? [];
+                    const parentCard = card.epicId ? cardsById[card.epicId] : null;
+                    return (
+                      <li key={card.id}>
+                        {/* Orphan child: parent lives in a different column */}
+                        {parentCard && (
+                          <div className="mb-1 flex items-center gap-1 pl-1 text-[0.65rem] text-slate-400 dark:text-slate-500">
+                            <CornerDownRight className="h-3 w-3 shrink-0" />
+                            <span className="truncate">
+                              subtask of &ldquo;{parentCard.title || "Untitled"}&rdquo;
+                            </span>
+                          </div>
+                        )}
+                        <SortableCard card={card} />
+                        {children.length > 0 && (
+                          <div className="ml-4 mt-1.5 border-l-2 border-slate-200 pl-3 dark:border-slate-700/50">
+                            <div className="mb-1.5 flex items-center gap-1 text-[0.65rem] font-medium text-slate-400 dark:text-slate-500">
+                              <CornerDownRight className="h-3 w-3 shrink-0" />
+                              {children.length} subtask{children.length > 1 ? "s" : ""}
+                            </div>
+                            <ul className="space-y-2">
+                              {children.map((child) => (
+                                <SortableCard key={child.id} card={child} />
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })
+                : cards.map((card) => <SortableCard key={card.id} card={card} />)}
             </ul>
           ) : (
             <EmptyColumn onAdd={() => addCard(column.id)} />
