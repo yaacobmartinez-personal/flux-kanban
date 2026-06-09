@@ -1,0 +1,329 @@
+-- Flux Kanban — multi-tenant schema with RLS
+-- Hierarchy: organization → members / projects(spaces) → columns → cards
+--
+-- RLS design notes:
+--  * Authorization helpers live in a NON-EXPOSED `private` schema and are
+--    SECURITY DEFINER so they bypass RLS on organization_members. This is what
+--    prevents the classic "infinite recursion detected in policy" error you get
+--    when a policy on organization_members queries organization_members.
+--  * Every helper filters by auth.uid() internally, so granting EXECUTE to
+--    `authenticated` only ever reveals facts about the *caller's own* access.
+--  * No authorization decision reads user_metadata (it is user-editable).
+
+-- ---------------------------------------------------------------------------
+-- Extensions
+-- ---------------------------------------------------------------------------
+create extension if not exists "pgcrypto";
+
+-- ---------------------------------------------------------------------------
+-- Private schema for security-definer authorization helpers
+-- ---------------------------------------------------------------------------
+create schema if not exists private;
+
+-- ---------------------------------------------------------------------------
+-- Tables
+-- ---------------------------------------------------------------------------
+
+-- Mirror of auth.users we can safely expose / embed in PostgREST joins.
+create table if not exists public.profiles (
+  id          uuid primary key references auth.users (id) on delete cascade,
+  email       text not null,
+  full_name   text,
+  avatar_url  text,
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists public.organizations (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null check (char_length(name) between 1 and 80),
+  created_by  uuid not null references public.profiles (id),
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists public.organization_members (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null references public.organizations (id) on delete cascade,
+  user_id     uuid not null references public.profiles (id) on delete cascade,
+  role        text not null default 'member' check (role in ('owner','admin','member')),
+  created_at  timestamptz not null default now(),
+  unique (org_id, user_id)
+);
+
+create table if not exists public.projects (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null references public.organizations (id) on delete cascade,
+  name        text not null check (char_length(name) between 1 and 80),
+  key         text not null check (char_length(key) between 1 and 8),
+  description text,
+  created_by  uuid not null references public.profiles (id),
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists public.columns (
+  id          uuid primary key default gen_random_uuid(),
+  project_id  uuid not null references public.projects (id) on delete cascade,
+  title       text not null default 'New column',
+  position    integer not null default 0,
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists public.cards (
+  id          uuid primary key default gen_random_uuid(),
+  column_id   uuid not null references public.columns (id) on delete cascade,
+  title       text not null default 'Untitled',
+  description text not null default '',
+  color       text not null default 'none',
+  due_date    date,
+  position    integer not null default 0,
+  created_by  uuid references public.profiles (id),
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists idx_members_org    on public.organization_members (org_id);
+create index if not exists idx_members_user    on public.organization_members (user_id);
+create index if not exists idx_projects_org    on public.projects (org_id);
+create index if not exists idx_columns_project on public.columns (project_id);
+create index if not exists idx_cards_column    on public.cards (column_id);
+
+-- ---------------------------------------------------------------------------
+-- Authorization helpers (SECURITY DEFINER, private schema)
+-- ---------------------------------------------------------------------------
+create or replace function private.is_org_member(_org uuid)
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1 from public.organization_members m
+    where m.org_id = _org and m.user_id = auth.uid()
+  );
+$$;
+
+create or replace function private.has_org_role(_org uuid, _roles text[])
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1 from public.organization_members m
+    where m.org_id = _org and m.user_id = auth.uid() and m.role = any (_roles)
+  );
+$$;
+
+create or replace function private.can_access_project(_project uuid)
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1
+    from public.projects p
+    join public.organization_members m on m.org_id = p.org_id
+    where p.id = _project and m.user_id = auth.uid()
+  );
+$$;
+
+create or replace function private.can_access_column(_column uuid)
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1
+    from public.columns c
+    join public.projects p on p.id = c.project_id
+    join public.organization_members m on m.org_id = p.org_id
+    where c.id = _column and m.user_id = auth.uid()
+  );
+$$;
+
+create or replace function private.shares_org(_other uuid)
+returns boolean language sql security definer set search_path = '' stable as $$
+  select exists (
+    select 1
+    from public.organization_members me
+    join public.organization_members them on them.org_id = me.org_id
+    where me.user_id = auth.uid() and them.user_id = _other
+  );
+$$;
+
+-- Policy expressions are evaluated as the invoking role, so authenticated
+-- needs USAGE on the schema + EXECUTE on the helpers. anon never does.
+grant usage on schema private to authenticated;
+grant execute on all functions in schema private to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Triggers: provision profile on signup, owner membership on org create
+-- ---------------------------------------------------------------------------
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.profiles (id, email, full_name)
+  values (
+    new.id,
+    new.email,
+    coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1))
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+create or replace function public.handle_new_org()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.organization_members (org_id, user_id, role)
+  values (new.id, new.created_by, 'owner')
+  on conflict (org_id, user_id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_org_created on public.organizations;
+create trigger on_org_created
+  after insert on public.organizations
+  for each row execute function public.handle_new_org();
+
+-- ---------------------------------------------------------------------------
+-- RPC: add a member by email (admins/owners only)
+-- A new invitee is not yet a co-member, so the caller cannot SELECT their
+-- profile under RLS — hence a definer RPC that does the lookup + insert after
+-- verifying the caller's role.
+-- ---------------------------------------------------------------------------
+create or replace function public.add_org_member(_org uuid, _email text, _role text default 'member')
+returns json language plpgsql security definer set search_path = '' as $$
+declare
+  _uid uuid;
+begin
+  if not private.has_org_role(_org, array['owner','admin']) then
+    raise exception 'Only owners and admins can add members';
+  end if;
+  if _role not in ('owner','admin','member') then
+    raise exception 'Invalid role: %', _role;
+  end if;
+
+  select id into _uid from public.profiles where lower(email) = lower(_email);
+  if _uid is null then
+    raise exception 'No Flux account exists for %. Ask them to sign up first.', _email;
+  end if;
+
+  insert into public.organization_members (org_id, user_id, role)
+  values (_org, _uid, _role)
+  on conflict (org_id, user_id) do update set role = excluded.role;
+
+  return json_build_object('user_id', _uid, 'email', _email, 'role', _role);
+end;
+$$;
+
+revoke execute on function public.add_org_member(uuid, text, text) from public;
+grant execute on function public.add_org_member(uuid, text, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Row Level Security
+-- ---------------------------------------------------------------------------
+alter table public.profiles             enable row level security;
+alter table public.organizations        enable row level security;
+alter table public.organization_members enable row level security;
+alter table public.projects             enable row level security;
+alter table public.columns              enable row level security;
+alter table public.cards                enable row level security;
+
+-- profiles -------------------------------------------------------------------
+create policy "profiles: read self or co-members" on public.profiles
+  for select to authenticated
+  using (id = (select auth.uid()) or private.shares_org(id));
+
+create policy "profiles: insert self" on public.profiles
+  for insert to authenticated
+  with check (id = (select auth.uid()));
+
+create policy "profiles: update self" on public.profiles
+  for update to authenticated
+  using (id = (select auth.uid()))
+  with check (id = (select auth.uid()));
+
+-- organizations --------------------------------------------------------------
+create policy "orgs: members read" on public.organizations
+  for select to authenticated
+  using (private.is_org_member(id));
+
+create policy "orgs: any authenticated can create" on public.organizations
+  for insert to authenticated
+  with check (created_by = (select auth.uid()));
+
+create policy "orgs: owners/admins update" on public.organizations
+  for update to authenticated
+  using (private.has_org_role(id, array['owner','admin']))
+  with check (private.has_org_role(id, array['owner','admin']));
+
+create policy "orgs: owners delete" on public.organizations
+  for delete to authenticated
+  using (private.has_org_role(id, array['owner']));
+
+-- organization_members -------------------------------------------------------
+create policy "members: co-members read" on public.organization_members
+  for select to authenticated
+  using (private.is_org_member(org_id));
+
+create policy "members: owners/admins add" on public.organization_members
+  for insert to authenticated
+  with check (private.has_org_role(org_id, array['owner','admin']));
+
+create policy "members: owners/admins change role" on public.organization_members
+  for update to authenticated
+  using (private.has_org_role(org_id, array['owner','admin']))
+  with check (private.has_org_role(org_id, array['owner','admin']));
+
+create policy "members: admins remove or self-leave" on public.organization_members
+  for delete to authenticated
+  using (
+    private.has_org_role(org_id, array['owner','admin'])
+    or user_id = (select auth.uid())
+  );
+
+-- projects -------------------------------------------------------------------
+create policy "projects: members read" on public.projects
+  for select to authenticated
+  using (private.is_org_member(org_id));
+
+create policy "projects: members create" on public.projects
+  for insert to authenticated
+  with check (private.is_org_member(org_id) and created_by = (select auth.uid()));
+
+create policy "projects: members update" on public.projects
+  for update to authenticated
+  using (private.is_org_member(org_id))
+  with check (private.is_org_member(org_id));
+
+create policy "projects: owners/admins delete" on public.projects
+  for delete to authenticated
+  using (private.has_org_role(org_id, array['owner','admin']));
+
+-- columns --------------------------------------------------------------------
+create policy "columns: project members read" on public.columns
+  for select to authenticated
+  using (private.can_access_project(project_id));
+
+create policy "columns: project members write" on public.columns
+  for insert to authenticated
+  with check (private.can_access_project(project_id));
+
+create policy "columns: project members update" on public.columns
+  for update to authenticated
+  using (private.can_access_project(project_id))
+  with check (private.can_access_project(project_id));
+
+create policy "columns: project members delete" on public.columns
+  for delete to authenticated
+  using (private.can_access_project(project_id));
+
+-- cards ----------------------------------------------------------------------
+create policy "cards: members read" on public.cards
+  for select to authenticated
+  using (private.can_access_column(column_id));
+
+create policy "cards: members create" on public.cards
+  for insert to authenticated
+  with check (private.can_access_column(column_id));
+
+create policy "cards: members update" on public.cards
+  for update to authenticated
+  using (private.can_access_column(column_id))
+  with check (private.can_access_column(column_id));
+
+create policy "cards: members delete" on public.cards
+  for delete to authenticated
+  using (private.can_access_column(column_id));
