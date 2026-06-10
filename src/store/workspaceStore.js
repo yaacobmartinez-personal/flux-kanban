@@ -39,25 +39,30 @@ export const useWorkspace = create((set, get) => ({
   },
 
   createOrg: async (name) => {
-   const { data: s } = await supabase.auth.getSession();
-    const token = s.session?.access_token;
-    const payload = token ? JSON.parse(atob(token.split('.')[1])) : null;
-    console.log('JWT payload:', payload);
-
     const { data: u } = await supabase.auth.getUser();
-    console.log('Current user:', u);
     const { data, error } = await supabase
       .from("organizations")
       .insert({ name, created_by: u.user.id })
       .select("id, name, created_by, created_at")
       .single();
-    if (error) {
-      console.log(error)
-      return { error }; 
-    }
+    if (error) return { error };
     set((s) => ({ orgs: [...s.orgs, data] }));
     await get().selectOrg(data.id);
     return { data };
+  },
+
+  // Delete the current organization (owner only, enforced by RLS). Cascades to
+  // its projects, columns, cards, comments, and memberships.
+  deleteOrg: async () => {
+    const orgId = get().currentOrgId;
+    if (!orgId) return { error: { message: "No organization selected" } };
+    const { error } = await supabase.from("organizations").delete().eq("id", orgId);
+    if (error) return { error };
+
+    localStorage.removeItem(projKey(orgId));
+    if (localStorage.getItem(ORG_KEY) === orgId) localStorage.removeItem(ORG_KEY);
+    await get().loadOrgs();
+    return {};
   },
 
   // ---- Members ----
@@ -151,6 +156,29 @@ export const useWorkspace = create((set, get) => ({
     const { error } = await supabase.from("projects").delete().eq("id", projectId);
     if (!error) await get().loadProjects(get().currentOrgId);
     return { error };
+  },
+
+  // Remove yourself from the current organization. RLS allows self-leave; the
+  // caller (UI) is responsible for blocking the sole-owner case.
+  leaveOrg: async () => {
+    const orgId = get().currentOrgId;
+    const { data: u } = await supabase.auth.getUser();
+    const userId = u.user?.id;
+    if (!orgId || !userId) return { error: { message: "Not signed in" } };
+
+    const { error } = await supabase
+      .from("organization_members")
+      .delete()
+      .eq("org_id", orgId)
+      .eq("user_id", userId);
+    if (error) return { error };
+
+    // Forget remembered selections for the org we just left.
+    localStorage.removeItem(projKey(orgId));
+    if (localStorage.getItem(ORG_KEY) === orgId) localStorage.removeItem(ORG_KEY);
+
+    await get().loadOrgs(); // refresh + auto-select another org (or none)
+    return {};
   },
 
   reset: () =>

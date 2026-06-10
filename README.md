@@ -11,6 +11,9 @@ Zustand + motion/react, backed by **Supabase** for auth and storage.
 - **Light / Dark / System** theme switching (no flash on load)
 - **Row Level Security** so members only ever see their own organizations' data
 
+> **Using the app?** See the [User Guide](USER_GUIDE.md) for step-by-step
+> instructions on every action.
+
 ---
 
 ## 1. Prerequisites
@@ -46,6 +49,14 @@ supabase db push
 > functions in a private `private` schema to evaluate membership without the
 > classic "infinite recursion in policy" error. Don't move those helpers into a
 > public/exposed schema.
+
+**Upgrading an existing database.** `0001_init.sql` is destructive (it drops and
+recreates everything) — only run it on a fresh project. If you already created
+the schema before per-project ticket numbers existed, run
+[`supabase/migrations/0002_card_numbers.sql`](supabase/migrations/0002_card_numbers.sql)
+once instead: it adds the columns, the numbering trigger, and backfills numbers
+onto your existing cards without touching any data. It's idempotent and a no-op
+on fresh installs.
 
 ## 4. Configure auth
 

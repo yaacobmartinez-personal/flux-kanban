@@ -5,6 +5,7 @@ import { supabase } from "../lib/supabase";
 const toLocalCard = (row) => ({
   id: row.id,
   columnId: row.column_id,
+  number: row.number ?? null,
   title: row.title,
   description: row.description ?? "",
   color: row.color ?? "none",
@@ -69,7 +70,7 @@ async function insertActivity(cardId, type, data = {}) {
 }
 
 const CARD_SELECT =
-  "id, column_id, title, description, color, label_text, due_date, position, assignee_id, reporter_id, epic_id, story_points, links, closed_at";
+  "id, column_id, number, title, description, color, label_text, due_date, position, assignee_id, reporter_id, epic_id, story_points, links, closed_at";
 
 // Fetch a project's columns + cards from the DB (no state mutation).
 async function fetchBoardData(projectId) {

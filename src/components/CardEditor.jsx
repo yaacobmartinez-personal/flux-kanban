@@ -309,6 +309,9 @@ export function CardEditor() {
   const allCards = useBoard((s) => s.cards);
   const columns = useBoard((s) => s.columns);
   const members = useWorkspace((s) => s.members);
+  const projectKey = useWorkspace(
+    (s) => s.projects.find((p) => p.id === s.currentProjectId)?.key
+  );
   const reduce = useReducedMotion();
 
   const open = Boolean(card);
@@ -360,8 +363,10 @@ export function CardEditor() {
             {/* Header */}
             <div className="flex items-center justify-between border-b border-slate-200/70 px-5 py-4 dark:border-slate-700/50">
               <div className="flex items-center gap-2">
-                <span className="text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                  Card details
+                <span className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-300">
+                  {projectKey && card.number != null
+                    ? `${projectKey}-${card.number}`
+                    : "Card details"}
                 </span>
                 {card.closedAt && (
                   <span className="rounded-full bg-slate-500/15 px-2 py-0.5 text-[0.65rem] font-medium text-slate-500 dark:text-slate-400">

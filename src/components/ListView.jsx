@@ -27,18 +27,24 @@ function AssigneeAvatar({ userId }) {
   );
 }
 
-function TicketRow({ card, columnTitle }) {
+function TicketRow({ card, columnTitle, projectKey }) {
   const openCard = useBoard((s) => s.openCard);
   const label = getLabel(card.color);
   const labelled = card.color && card.color !== "none";
+  const ticket = projectKey && card.number != null ? `${projectKey}-${card.number}` : null;
 
   return (
     <li
       onClick={() => openCard(card.id)}
       className="flex cursor-pointer items-center gap-3 border-b border-slate-200 px-4 py-3 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/40 sm:px-6"
     >
-      {/* Left: label chip + title */}
+      {/* Left: ticket + label chip + title */}
       <div className="flex min-w-0 flex-1 items-center gap-2.5">
+        {ticket && (
+          <span className="shrink-0 font-mono text-[0.65rem] font-semibold text-slate-400 dark:text-slate-500">
+            {ticket}
+          </span>
+        )}
         {labelled && (
           <span
             className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[0.65rem] font-medium"
@@ -82,6 +88,9 @@ function TicketRow({ card, columnTitle }) {
 export function ListView() {
   const columns = useBoard((s) => s.columns);
   const cardsById = useBoard((s) => s.cards);
+  const projectKey = useWorkspace(
+    (s) => s.projects.find((p) => p.id === s.currentProjectId)?.key
+  );
 
   const rows = columns.flatMap((col) =>
     col.cardIds
@@ -101,7 +110,12 @@ export function ListView() {
     <div className="scroll-thin h-full overflow-y-auto">
       <ul>
         {rows.map(({ card, columnTitle }) => (
-          <TicketRow key={card.id} card={card} columnTitle={columnTitle} />
+          <TicketRow
+            key={card.id}
+            card={card}
+            columnTitle={columnTitle}
+            projectKey={projectKey}
+          />
         ))}
       </ul>
     </div>

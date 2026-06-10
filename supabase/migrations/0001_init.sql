@@ -86,6 +86,7 @@ create table if not exists public.projects (
   name        text not null check (char_length(name) between 1 and 80),
   key         text not null check (char_length(key) between 1 and 8),
   description text,
+  card_seq    integer not null default 0, -- last assigned ticket number for this project
   created_by  uuid not null references public.profiles (id),
   created_at  timestamptz not null default now()
 );
@@ -101,6 +102,7 @@ create table if not exists public.columns (
 create table if not exists public.cards (
   id           uuid primary key default gen_random_uuid(),
   column_id    uuid not null references public.columns (id) on delete cascade,
+  number       integer, -- per-project ticket number, assigned by trigger (KEY-N)
   title        text not null default 'Untitled',
   description  text not null default '',
   color        text not null default 'none',
@@ -423,6 +425,58 @@ create policy "activity: members create" on public.card_activity
   with check (actor_id = (select auth.uid()) and private.can_access_card(card_id));
 
 -- ===========================================================================
+-- 4b. INTEGRITY: every organization always keeps at least one owner
+--
+-- Prevents orphaning an org (a row with members but no owner, or no members at
+-- all). You cannot remove or demote the last owner. To dissolve an org you must
+-- delete the org itself (owner-only) — which cascades; the trigger below detects
+-- that cascade via a transaction-local flag and steps aside so it can proceed.
+-- ===========================================================================
+create function private.mark_org_deleting() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform set_config('flux.deleting_org', old.id::text, true);
+  return old;
+end;
+$$;
+
+create trigger org_deleting before delete on public.organizations
+  for each row execute function private.mark_org_deleting();
+
+create function private.enforce_owner_present() returns trigger
+language plpgsql security definer set search_path = '' as $$
+declare
+  _org uuid := coalesce(old.org_id, new.org_id);
+  _owners integer;
+begin
+  -- Allow the cascade when the whole org is being deleted.
+  if current_setting('flux.deleting_org', true) = _org::text then
+    return coalesce(new, old);
+  end if;
+
+  -- Count owners that would remain after this change (exclude the row itself).
+  select count(*) into _owners
+  from public.organization_members
+  where org_id = _org and role = 'owner' and id <> old.id;
+
+  if tg_op = 'UPDATE' and new.role = 'owner' then
+    _owners := _owners + 1;
+  end if;
+
+  if _owners = 0 then
+    raise exception
+      'An organization must always have at least one owner. Make another member an owner first.';
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger enforce_owner_present
+  before update or delete on public.organization_members
+  for each row execute function private.enforce_owner_present();
+
+-- ===========================================================================
 -- 5. RATE LIMITING (server-side, non-bypassable)
 --
 -- The client limiter in src/lib/supabase.js only smooths bursts; a hand-crafted
@@ -522,6 +576,33 @@ create trigger rl_before_insert before insert on public.card_activity
 
 create trigger rl_before_insert before insert on public.columns
   for each row execute function private.rl_columns();
+
+-- ===========================================================================
+-- 5b. TICKET NUMBERS  (Jira-style KEY-N, sequential per project)
+--
+-- Each card gets a per-project number. The counter lives on projects.card_seq
+-- and is bumped atomically inside a BEFORE INSERT trigger: the UPDATE ... RETURNING
+-- takes a row lock on the project, so concurrent inserts serialize and can never
+-- receive the same number. Deleting a card does not reuse its number (like Jira).
+-- ===========================================================================
+create function private.assign_card_number() returns trigger
+language plpgsql security definer set search_path = '' as $$
+declare
+  _project uuid;
+  _n integer;
+begin
+  if new.number is not null then
+    return new; -- preserve explicitly-set numbers (imports / backfill)
+  end if;
+  select col.project_id into _project from public.columns col where col.id = new.column_id;
+  update public.projects set card_seq = card_seq + 1 where id = _project returning card_seq into _n;
+  new.number := _n;
+  return new;
+end;
+$$;
+
+create trigger assign_card_number before insert on public.cards
+  for each row execute function private.assign_card_number();
 
 -- ===========================================================================
 -- 6. REALTIME

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { X, UserPlus, Loader2 } from "lucide-react";
+import { X, UserPlus, Loader2, LogOut } from "lucide-react";
 import { useWorkspace } from "../store/workspaceStore";
 import { useAuth } from "../store/authStore";
 
@@ -18,14 +18,33 @@ export function MembersPanel({ open, onClose }) {
   const addMember = useWorkspace((s) => s.addMember);
   const updateMemberRole = useWorkspace((s) => s.updateMemberRole);
   const removeMember = useWorkspace((s) => s.removeMember);
+  const leaveOrg = useWorkspace((s) => s.leaveOrg);
   const myId = useAuth((s) => s.user?.id);
 
   const canManage = myRole === "owner" || myRole === "admin";
+  const ownerCount = members.filter((m) => m.role === "owner").length;
+  const isSoleOwner = myRole === "owner" && ownerCount === 1;
 
   const [email, setEmail] = useState("");
   const [role, setRole] = useState("member");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const [leaveBusy, setLeaveBusy] = useState(false);
+  const [leaveError, setLeaveError] = useState(null);
+
+  const doLeave = async () => {
+    setLeaveBusy(true);
+    setLeaveError(null);
+    const { error } = await leaveOrg();
+    setLeaveBusy(false);
+    if (error) setLeaveError(error.message);
+    else {
+      setConfirmLeave(false);
+      onClose();
+    }
+  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -184,6 +203,62 @@ export function MembersPanel({ open, onClose }) {
                 );
               })}
             </ul>
+
+            {/* Footer: leave organization */}
+            <div className="border-t border-slate-200/70 px-5 py-4 dark:border-slate-700/50">
+              {confirmLeave ? (
+                <div className="space-y-2.5">
+                  <p className="text-xs text-slate-600 dark:text-slate-300">
+                    Leave this organization? You'll lose access to its projects and
+                    boards until someone re-invites you.
+                  </p>
+                  {leaveError && (
+                    <p role="alert" className="text-xs font-medium text-rose-500">
+                      {leaveError}
+                    </p>
+                  )}
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={doLeave}
+                      disabled={leaveBusy}
+                      className="flex items-center justify-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-600 transition hover:bg-rose-500/20 disabled:opacity-60 dark:text-rose-300"
+                    >
+                      {leaveBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      Yes, leave
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmLeave(false)}
+                      className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLeaveError(null);
+                      setConfirmLeave(true);
+                    }}
+                    disabled={isSoleOwner}
+                    className="flex items-center gap-1.5 text-sm font-medium text-slate-500 transition hover:text-rose-500 disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:text-slate-400 dark:text-slate-400 dark:disabled:text-slate-500"
+                  >
+                    <LogOut className="h-4 w-4" />
+                    Leave organization
+                  </button>
+                  {isSoleOwner && (
+                    <p className="mt-1.5 text-[0.7rem] text-slate-400">
+                      You're the only owner. Make another member an owner first, or
+                      delete the organization.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
           </motion.aside>
         </div>
       )}

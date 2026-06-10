@@ -24,6 +24,10 @@ function CardFaceBase({ card, dragging = false }) {
   const label = getLabel(card.color);
   const labelled = card.color && card.color !== "none";
   const hasFooter = labelled || card.storyPoints != null || card.assigneeId;
+  const projectKey = useWorkspace(
+    (s) => s.projects.find((p) => p.id === s.currentProjectId)?.key
+  );
+  const ticket = projectKey && card.number != null ? `${projectKey}-${card.number}` : null;
 
   return (
     <div
@@ -41,6 +45,12 @@ function CardFaceBase({ card, dragging = false }) {
           className="absolute inset-y-0 left-0 w-1"
           style={{ backgroundColor: label.bar }}
         />
+      )}
+
+      {ticket && (
+        <p className="pl-1.5 font-mono text-[0.6rem] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+          {ticket}
+        </p>
       )}
 
       <p className="pl-1.5 text-[0.9rem] font-medium leading-snug text-slate-800 dark:text-slate-100">
