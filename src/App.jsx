@@ -10,6 +10,7 @@ import { TopBar } from "./components/TopBar";
 import { Board } from "./components/Board";
 import { CardEditor } from "./components/CardEditor";
 import { Onboarding } from "./components/Onboarding";
+import { Toaster } from "./components/Toaster";
 
 function FullScreen({ children }) {
   return (
@@ -32,6 +33,8 @@ export default function App() {
   const resetWorkspace = useWorkspace((s) => s.reset);
 
   const loadBoard = useBoard((s) => s.loadBoard);
+  const subscribeRealtime = useBoard((s) => s.subscribeRealtime);
+  const unsubscribeRealtime = useBoard((s) => s.unsubscribeRealtime);
 
   useEffect(() => {
     init();
@@ -43,10 +46,14 @@ export default function App() {
     else resetWorkspace();
   }, [userId, loadOrgs, resetWorkspace]);
 
-  // Load the board for the selected project.
+  // Load the board for the selected project, and subscribe to realtime changes
+  // so teammates' edits appear without a refresh.
   useEffect(() => {
-    if (currentProjectId) loadBoard(currentProjectId);
-  }, [currentProjectId, loadBoard]);
+    if (!currentProjectId) return;
+    loadBoard(currentProjectId);
+    subscribeRealtime(currentProjectId);
+    return () => unsubscribeRealtime();
+  }, [currentProjectId, loadBoard, subscribeRealtime, unsubscribeRealtime]);
 
   if (!isConfigured) return <ConfigNotice />;
 
@@ -76,6 +83,7 @@ export default function App() {
         )}
       </main>
       <CardEditor />
+      <Toaster />
     </div>
   );
 }

@@ -28,6 +28,11 @@ const cardSnapshots = new Map();
 // Per-drag move tracking: cardId -> { fromTitle, toTitle }
 const cardColumnMoves = new Map();
 
+// Realtime subscription + debounce timers.
+let realtimeChannel = null;
+let resyncTimer = null;
+let threadTimer = null;
+
 const LOCAL_TO_DB = {
   title: "title",
   description: "description",
@@ -66,6 +71,52 @@ async function insertActivity(cardId, type, data = {}) {
 const CARD_SELECT =
   "id, column_id, title, description, color, label_text, due_date, position, assignee_id, reporter_id, epic_id, story_points, links, closed_at";
 
+// Fetch a project's columns + cards from the DB (no state mutation).
+async function fetchBoardData(projectId) {
+  const { data: cols } = await supabase
+    .from("columns")
+    .select("id, title, position")
+    .eq("project_id", projectId)
+    .order("position", { ascending: true });
+
+  const columnIds = (cols ?? []).map((c) => c.id);
+  let cardRows = [];
+  if (columnIds.length) {
+    const { data } = await supabase
+      .from("cards")
+      .select(CARD_SELECT)
+      .in("column_id", columnIds)
+      .order("position", { ascending: true });
+    cardRows = data ?? [];
+  }
+  return { cols: cols ?? [], cardRows };
+}
+
+// Build the local {columns, cards} shape from DB rows.
+// `overlayPending` keeps any un-flushed local edits on top of remote rows so a
+// realtime re-sync never clobbers what the user is currently typing.
+function buildBoardState(cols, cardRows, { overlayPending = false } = {}) {
+  const cards = {};
+  const byColumn = {};
+  cols.forEach((c) => (byColumn[c.id] = []));
+  cardRows.forEach((row) => {
+    const remote = toLocalCard(row);
+    if (overlayPending && cardPending.has(row.id)) {
+      cards[row.id] = { ...remote, ...cardPending.get(row.id) };
+    } else {
+      cards[row.id] = remote;
+      cardSnapshots.set(row.id, snapshotCard(remote));
+    }
+    (byColumn[row.column_id] ??= []).push(row.id);
+  });
+  const columns = cols.map((c) => ({
+    id: c.id,
+    title: c.title,
+    cardIds: byColumn[c.id] ?? [],
+  }));
+  return { columns, cards };
+}
+
 export const useBoard = create((set, get) => ({
   projectId: null,
   loading: false,
@@ -75,46 +126,18 @@ export const useBoard = create((set, get) => ({
   activity: {}, // { [cardId]: ActivityEvent[] }
   editingCardId: null,
 
+  _resyncQueued: false,
+
   // ---- Load ----
   loadBoard: async (projectId) => {
     set({ loading: true, projectId, columns: [], cards: {}, comments: {}, activity: {}, editingCardId: null });
+    cardSnapshots.clear();
 
-    const { data: cols } = await supabase
-      .from("columns")
-      .select("id, title, position")
-      .eq("project_id", projectId)
-      .order("position", { ascending: true });
+    const { cols, cardRows } = await fetchBoardData(projectId);
+    if (get().projectId !== projectId) return; // a faster project switch won
 
-    const columnIds = (cols ?? []).map((c) => c.id);
-    let cardRows = [];
-    if (columnIds.length) {
-      const { data } = await supabase
-        .from("cards")
-        .select(CARD_SELECT)
-        .in("column_id", columnIds)
-        .order("position", { ascending: true });
-      cardRows = data ?? [];
-    }
-
-    const cards = {};
-    const byColumn = {};
-    columnIds.forEach((id) => (byColumn[id] = []));
-    cardRows.forEach((row) => {
-      const card = toLocalCard(row);
-      cards[row.id] = card;
-      cardSnapshots.set(row.id, snapshotCard(card));
-      (byColumn[row.column_id] ??= []).push(row.id);
-    });
-
-    set({
-      loading: false,
-      columns: (cols ?? []).map((c) => ({
-        id: c.id,
-        title: c.title,
-        cardIds: byColumn[c.id] ?? [],
-      })),
-      cards,
-    });
+    const { columns, cards } = buildBoardState(cols, cardRows);
+    set({ loading: false, columns, cards });
   },
 
   // ---- Columns ----
@@ -327,6 +350,86 @@ export const useBoard = create((set, get) => ({
       }
     }
     cardColumnMoves.clear();
+
+    // Realtime events that arrived mid-drag were deferred — apply them now.
+    if (get()._resyncQueued) {
+      set({ _resyncQueued: false });
+      get().scheduleResync();
+    }
+  },
+
+  // ---- Realtime sync ----
+  subscribeRealtime: (projectId) => {
+    if (!supabase || !projectId) return;
+    get().unsubscribeRealtime();
+    realtimeChannel = supabase
+      .channel(`board:${projectId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "columns", filter: `project_id=eq.${projectId}` },
+        () => get().scheduleResync()
+      )
+      // cards have no project_id column, so we can't filter here; RLS already
+      // limits events to the user's orgs and scheduleResync re-reads only the
+      // current project, so cross-project noise is just a coalesced no-op.
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "cards" },
+        () => get().scheduleResync()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "comments" },
+        () => get()._onThreadChange()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "card_activity" },
+        () => get()._onThreadChange()
+      )
+      .subscribe();
+  },
+
+  unsubscribeRealtime: () => {
+    if (realtimeChannel && supabase) {
+      supabase.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+    clearTimeout(resyncTimer);
+    clearTimeout(threadTimer);
+  },
+
+  // Debounced board re-sync. Deferred while a drag is in flight (dnd-kit owns
+  // the list during a drag; mutating it mid-drag would desync the sortable).
+  scheduleResync: () => {
+    if (document.body.classList.contains("dragging-active")) {
+      set({ _resyncQueued: true });
+      return;
+    }
+    clearTimeout(resyncTimer);
+    resyncTimer = setTimeout(() => get()._resyncBoard(), 250);
+  },
+
+  _resyncBoard: async () => {
+    const projectId = get().projectId;
+    if (!projectId || !supabase) return;
+    const { cols, cardRows } = await fetchBoardData(projectId);
+    if (get().projectId !== projectId) return; // project switched mid-fetch
+    const { columns, cards } = buildBoardState(cols, cardRows, { overlayPending: true });
+    set({ columns, cards });
+  },
+
+  // Reload the open card's comments + activity when either thread changes.
+  _onThreadChange: () => {
+    if (!get().editingCardId) return;
+    clearTimeout(threadTimer);
+    threadTimer = setTimeout(() => {
+      const id = get().editingCardId;
+      if (id) {
+        get().loadComments(id);
+        get().loadActivity(id);
+      }
+    }, 250);
   },
 
   // ---- Editor ----

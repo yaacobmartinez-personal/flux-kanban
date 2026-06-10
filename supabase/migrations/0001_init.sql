@@ -1,5 +1,13 @@
--- Flux Kanban — multi-tenant schema with RLS
+-- Flux Kanban — full schema, RLS, rate limiting, and realtime
 -- Hierarchy: organization → members / projects(spaces) → columns → cards
+--
+-- Sections:
+--   1. Schema (tables + indexes)
+--   2. Authorization helpers (SECURITY DEFINER, private schema)
+--   3. Triggers + member-invite RPC
+--   4. Row Level Security policies
+--   5. Rate limiting (per-user/per-action, enforced in triggers)
+--   6. Realtime (supabase_realtime publication)
 --
 -- RLS design notes:
 --  * Authorization helpers live in a NON-EXPOSED `private` schema and are
@@ -13,6 +21,8 @@
 -- ---------------------------------------------------------------------------
 -- Teardown: drop everything so this script is safe to re-run from scratch.
 -- CASCADE on tables removes their policies, indexes, and dependent triggers.
+-- `drop schema private cascade` removes the auth helpers AND the rate-limit
+-- objects (rate_limits table + functions) that live in that schema.
 -- ---------------------------------------------------------------------------
 drop trigger if exists on_auth_user_created on auth.users;
 
@@ -37,13 +47,13 @@ drop schema if exists private cascade;
 create extension if not exists "pgcrypto";
 
 -- ---------------------------------------------------------------------------
--- Private schema for security-definer authorization helpers
+-- Private schema for security-definer helpers (auth + rate limiting)
 -- ---------------------------------------------------------------------------
 create schema if not exists private;
 
--- ---------------------------------------------------------------------------
--- Tables
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- 1. SCHEMA
+-- ===========================================================================
 
 -- Mirror of auth.users we can safely expose / embed in PostgREST joins.
 create table if not exists public.profiles (
@@ -133,9 +143,9 @@ create index if not exists idx_cards_column    on public.cards (column_id);
 create index if not exists idx_comments_card        on public.comments (card_id);
 create index if not exists idx_card_activity_card   on public.card_activity (card_id, created_at desc);
 
--- ---------------------------------------------------------------------------
--- Authorization helpers (SECURITY DEFINER, private schema)
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- 2. AUTHORIZATION HELPERS (SECURITY DEFINER, private schema)
+-- ===========================================================================
 create or replace function private.is_org_member(_org uuid)
 returns boolean language sql security definer set search_path = '' stable as $$
   select exists (
@@ -200,9 +210,9 @@ $$;
 grant usage on schema private to authenticated;
 grant execute on all functions in schema private to authenticated;
 
--- ---------------------------------------------------------------------------
--- Triggers: provision profile on signup, owner membership on org create
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- 3. TRIGGERS + MEMBER-INVITE RPC
+-- ===========================================================================
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = '' as $$
 begin
@@ -235,12 +245,9 @@ create trigger on_org_created
   after insert on public.organizations
   for each row execute function public.handle_new_org();
 
--- ---------------------------------------------------------------------------
--- RPC: add a member by email (admins/owners only)
 -- A new invitee is not yet a co-member, so the caller cannot SELECT their
 -- profile under RLS — hence a definer RPC that does the lookup + insert after
 -- verifying the caller's role.
--- ---------------------------------------------------------------------------
 create or replace function public.add_org_member(_org uuid, _email text, _role text default 'member')
 returns json language plpgsql security definer set search_path = '' as $$
 declare
@@ -269,9 +276,9 @@ $$;
 revoke execute on function public.add_org_member(uuid, text, text) from public;
 grant execute on function public.add_org_member(uuid, text, text) to authenticated;
 
--- ---------------------------------------------------------------------------
--- Row Level Security
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- 4. ROW LEVEL SECURITY
+-- ===========================================================================
 alter table public.profiles             enable row level security;
 alter table public.organizations        enable row level security;
 alter table public.organization_members enable row level security;
@@ -414,3 +421,138 @@ create policy "activity: members read" on public.card_activity
 create policy "activity: members create" on public.card_activity
   for insert to authenticated
   with check (actor_id = (select auth.uid()) and private.can_access_card(card_id));
+
+-- ===========================================================================
+-- 5. RATE LIMITING (server-side, non-bypassable)
+--
+-- The client limiter in src/lib/supabase.js only smooths bursts; a hand-crafted
+-- REST call ignores it. Here, per-user/per-action counters are enforced inside
+-- BEFORE INSERT triggers.
+--
+-- How a rejection surfaces: we RAISE with SQLSTATE 'PT429'. PostgREST maps
+-- PTxyz codes to HTTP status xyz, so the client receives a real HTTP 429. The
+-- hint ('RATE_LIMIT') lets the client tell our limit apart from a platform one.
+-- ===========================================================================
+
+-- One row per (user, action); a fixed window that resets when it elapses.
+create table private.rate_limits (
+  user_id      uuid not null,
+  action       text not null,
+  window_start timestamptz not null default now(),
+  count        integer not null default 0,
+  primary key (user_id, action)
+);
+
+-- Increments the caller's counter for `action`. If it exceeds `max` within
+-- `window`, raises PT429 — which also rolls back the increment, so blocked
+-- attempts don't inflate the counter past the ceiling.
+create function private.check_rate_limit(_action text, _max integer, _window interval)
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  _uid uuid := auth.uid();
+  _now timestamptz := clock_timestamp();
+  _cnt integer;
+begin
+  -- No JWT (service role, internal jobs) → not subject to per-user limits.
+  if _uid is null then
+    return;
+  end if;
+
+  insert into private.rate_limits as r (user_id, action, window_start, count)
+  values (_uid, _action, _now, 1)
+  on conflict (user_id, action) do update
+    set count = case when r.window_start < _now - _window then 1 else r.count + 1 end,
+        window_start = case when r.window_start < _now - _window then _now else r.window_start end
+  returning count into _cnt;
+
+  if _cnt > _max then
+    raise sqlstate 'PT429'
+      using message = format('Rate limit reached for %s. Please slow down and retry shortly.', _action),
+            hint = 'RATE_LIMIT';
+  end if;
+end;
+$$;
+
+-- Not granted to authenticated: triggers call it within the table-owner context.
+revoke all on function private.check_rate_limit(text, integer, interval) from public;
+
+-- Trigger wrappers. Limits are generous enough never to bother a real user.
+-- Only INSERTs are throttled — a single legitimate drag of a long column issues
+-- many position UPDATEs in one batch and must not be rejected.
+create function private.rl_cards() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform private.check_rate_limit('card_insert', 120, interval '1 minute');
+  return new;
+end;
+$$;
+
+create function private.rl_comments() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform private.check_rate_limit('comment_insert', 30, interval '1 minute');
+  return new;
+end;
+$$;
+
+create function private.rl_activity() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform private.check_rate_limit('activity_insert', 300, interval '1 minute');
+  return new;
+end;
+$$;
+
+create function private.rl_columns() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform private.check_rate_limit('column_insert', 40, interval '1 minute');
+  return new;
+end;
+$$;
+
+create trigger rl_before_insert before insert on public.cards
+  for each row execute function private.rl_cards();
+
+create trigger rl_before_insert before insert on public.comments
+  for each row execute function private.rl_comments();
+
+create trigger rl_before_insert before insert on public.card_activity
+  for each row execute function private.rl_activity();
+
+create trigger rl_before_insert before insert on public.columns
+  for each row execute function private.rl_columns();
+
+-- ===========================================================================
+-- 6. REALTIME
+--
+-- Add the board tables to the supabase_realtime publication so clients can
+-- subscribe to Postgres changes. RLS still applies: a user only receives change
+-- events for rows they're allowed to SELECT.
+-- ===========================================================================
+do $$
+begin
+  if not exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    create publication supabase_realtime;
+  end if;
+
+  if not exists (select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'columns') then
+    alter publication supabase_realtime add table public.columns;
+  end if;
+
+  if not exists (select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'cards') then
+    alter publication supabase_realtime add table public.cards;
+  end if;
+
+  if not exists (select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'comments') then
+    alter publication supabase_realtime add table public.comments;
+  end if;
+
+  if not exists (select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'card_activity') then
+    alter publication supabase_realtime add table public.card_activity;
+  end if;
+end $$;

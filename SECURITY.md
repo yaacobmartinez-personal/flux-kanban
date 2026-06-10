@@ -187,6 +187,45 @@ supabase db advisors        # CLI v2.81.3+  (or MCP get_advisors)
 
 ---
 
+## 8. Rate limiting
+
+Two layers, with clearly different jobs:
+
+**Client-side (UX / cost, _not_ security).**
+[`src/lib/supabase.js`](src/lib/supabase.js) routes every Supabase request through
+a token-bucket + concurrency-capped `fetch` (sustained ~10 req/s, burst 12, max 6
+concurrent, FIFO queue). It smooths the app's natural bursts — debounced card
+writes, per-drag position flushes, activity inserts — and retries genuine
+*platform* `429`s with `Retry-After` backoff. Because it runs in the browser, a
+hostile client bypasses it by calling the REST API directly. So it is explicitly
+**not** an abuse boundary.
+
+**Server-side (the real ceiling).**
+[`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) §5
+enforces per-user/per-action limits inside `BEFORE INSERT` triggers via
+`private.check_rate_limit(action, max, window)`:
+
+- Counters live in `private.rate_limits` — a private-schema table, never exposed
+  to the Data API and never granted to `authenticated`. Only the
+  `SECURITY DEFINER` function writes it (filtered by `auth.uid()`), consistent
+  with the rest of this schema (§3).
+- Over-limit raises `SQLSTATE 'PT429'`. PostgREST maps `PTxyz` codes to HTTP
+  status `xyz`, so the client gets a real **429**; the `hint = 'RATE_LIMIT'` lets
+  the client limiter tell *our* limit apart from a platform throttle and surface
+  it immediately (a toast) instead of retrying.
+- The raise rolls back the over-limit increment, so blocked attempts can't push
+  the counter past the ceiling — the window holds until it elapses.
+
+Why only INSERTs are throttled: a single legitimate drag of a long column issues
+many position **UPDATE**s in one batch, so throttling updates would reject normal
+use. Updates are smoothed by the client limiter instead; inserts (cards,
+comments, columns, activity) are where spam/abuse actually lands.
+
+Limits are deliberately generous (comments 30/min, columns 40/min, cards 120/min,
+activity 300/min) and live in the migration — tune per your threat model. They do
+**not** replace Supabase's platform-level protections (Auth rate limits, network
+restrictions); they complement them at the application layer.
+
 ## Reporting
 
 This is a demo project. For a real deployment, route security reports to a

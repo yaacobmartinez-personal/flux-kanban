@@ -26,14 +26,14 @@ npm install
 
 ## 3. Create the database schema
 
-The full schema, triggers, and RLS policies live in
+The full schema, triggers, RLS policies, rate limiting, and realtime setup live
+in a single file:
 [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql).
 
 **Option A — Supabase SQL Editor (quickest):**
 
 1. Open your project → **SQL Editor** → **New query**.
-2. Paste the entire contents of `supabase/migrations/0001_init.sql`.
-3. **Run**.
+2. Paste the entire contents of `supabase/migrations/0001_init.sql`. **Run**.
 
 **Option B — Supabase CLI:**
 
@@ -124,9 +124,47 @@ pre-ship checklist.
 
 ---
 
+## Rate limiting
+
+Two layers (see [SECURITY.md](SECURITY.md) §8 for details):
+
+- **Client-side** ([`src/lib/supabase.js`](src/lib/supabase.js)) — a token-bucket
+  + concurrency-capped `fetch` wraps the Supabase client, so every call is
+  smoothed (sustained ~10 req/s, burst 12, max 6 in flight). Platform `429`s are
+  retried with `Retry-After` backoff. This protects cost / free-tier limits but
+  is **bypassable** — not a security control.
+- **Server-side** ([`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) §5)
+  — per-user/per-action counters enforced in `BEFORE INSERT` triggers
+  (`check_rate_limit`). Exceeding a limit raises SQLSTATE `PT429`, which PostgREST
+  returns as HTTP **429**. This is the real ceiling. Defaults: comments 30/min,
+  columns 40/min, cards 120/min, activity 300/min — tune in the migration.
+
+When the server-side limit trips, the client shows a toast
+([`src/components/Toaster.jsx`](src/components/Toaster.jsx)).
+
+## Realtime sync
+
+Teammates' changes appear without a refresh. While viewing a project, the board
+subscribes to Postgres changes on `columns`, `cards`, `comments`, and
+`card_activity` ([`src/store/boardStore.js`](src/store/boardStore.js) →
+`subscribeRealtime`). RLS still applies — you only receive events for rows you
+can read.
+
+- Structural changes (add/move/reorder/delete) trigger a **debounced board
+  re-sync** that is **deferred while you're dragging** (dnd-kit owns the list
+  mid-drag) and runs the moment the drag ends.
+- The re-sync **overlays your un-flushed local edits**, so a teammate's update
+  can't clobber text you're actively typing.
+- Comment/activity changes reload the open card's threads only.
+
+The migration (§6) adds the tables to the `supabase_realtime` publication. It's
+enabled by default for projects created via the dashboard, and the block is
+idempotent.
+
 ## Notes & next steps
 
-- **Realtime** isn't wired up — changes from other users appear on reload. Adding
-  `supabase.channel(...)` subscriptions per project is a natural next step.
+- **Realtime** is wired up (see above). It re-syncs the board rather than applying
+  per-row patches — simple and correct; a per-row diff would be the optimization
+  if card counts get large.
 - **Member invites** require an existing account (no email-invite flow yet).
 - To reset the demo selection, clear the `flux-*` keys in `localStorage`.
